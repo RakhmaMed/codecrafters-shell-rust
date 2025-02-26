@@ -13,8 +13,10 @@ fn main() {
         stdin.read_line(&mut input).unwrap();
         if input.trim() == "exit 0" {
             std::process::exit(0);
+        } else if input.starts_with("echo ") {
+            println!("{}", &input[5..].trim());
+        } else {
+            println!("{}: command not found", input.trim());
         }
-
-        println!("{}: command not found", input.trim());
     }
 }
