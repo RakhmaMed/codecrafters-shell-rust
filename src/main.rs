@@ -32,12 +32,15 @@ fn find_exec_in_path(name: &str) -> Option<String> {
 }
 
 fn type_buildin(name: &str) -> String {
-    if name.starts_with("echo") || name.starts_with("exit") || name.starts_with("type") {
-        return format!("{} is a shell builtin", name);
+    let command = name.split_whitespace();
+    match command {
+        Some("echo") | Some("exit") | Some("type") => return format!("{} is a shell builtin", name)
     }
+    
     if let Some(path) = find_exec_in_path(name) {
         return format!("{} is {}/{}", name, path, name);
     }
+    
     format!("{} not found", name)
 }
 
@@ -50,15 +53,13 @@ fn main() {
         let stdin = io::stdin();
         let mut input = String::new();
         stdin.read_line(&mut input).unwrap();
-        if input.trim() == "exit 0" {
-            std::process::exit(0);
-        } else if input.starts_with("echo ") {
-            println!("{}", &input[5..].trim());
-        } else if input.starts_with("type ") {
-            let msg = type_buildin(&input[5..].trim());
-            println!("{}", msg);
-        } else {
-            println!("{}: command not found", input.trim());
+        match input.trim() {
+            "exit 0" => break,
+            input if input.starts_with("echo ") => println!("{}", &input[5..]),
+            input if input.starts_with("type ") {
+                let msg = type_buildin(&input[5..]);
+                println!("{}", msg);
+            },
+            _ => println!("{}: command not found", input.trim())
         }
-    }
 }
