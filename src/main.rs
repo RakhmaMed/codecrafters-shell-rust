@@ -1,7 +1,10 @@
+use core::slice::SlicePattern;
+use std::any::Any;
 use std::env;
 use std::fs;
 #[allow(unused_imports)]
 use std::io::{self, Write};
+use std::process::Command;
 
 fn find_exec_in_fs(path: &str, name: &str) -> io::Result<String> {
     for p in path.split(":") {
@@ -38,6 +41,22 @@ fn type_buildin(name: &str) -> String {
     format!("{} not found", name)
 }
 
+fn try_call(command: &str, arg1: &str) {
+    if let Some(path) = find_exec_in_path(command) {
+        let output = Command::new(path)
+            .arg(arg1)
+            .output()
+            .expect("Failed to execute command");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            println!("{}", stdout);
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("{}", stderr);
+        }
+    }
+}
+
 fn main() {
     loop {
         print!("$ ");
@@ -47,13 +66,23 @@ fn main() {
         let stdin = io::stdin();
         let mut input = String::new();
         stdin.read_line(&mut input).unwrap();
-        match input.trim() {
-            "exit 0" => break,
-            input if input.starts_with("echo ") => println!("{}", &input[5..]),
-            input if input.starts_with("type ") => {
-                let msg = type_buildin(&input[5..]);
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        let mut full_command = input.split_whitespace();
+        let command = full_command.next();
+        let args: Vec<&str> = full_command.collect();
+
+        match (command, args.as_slice()) {
+            (Some("exit"), [exit_code, ..]) => std::process::exit(exit_code.parse().or(-1)),
+            (Some("echo"), [_, ..]) => println!("{}", args.join(" ")),
+            (Some("type"), [cmd, ..]) => {
+                let msg = type_buildin(cmd);
                 println!("{}", msg);
             }
+            (Some(cmd), [arg1, ..]) => try_call(cmd, arg1),
             _ => println!("{}: command not found", input.trim()),
         }
     }
