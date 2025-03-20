@@ -1,8 +1,5 @@
-use core::slice::SlicePattern;
-use std::any::Any;
 use std::env;
 use std::fs;
-#[allow(unused_imports)]
 use std::io::{self, Write};
 use std::process::Command;
 
@@ -76,7 +73,7 @@ fn main() {
         let args: Vec<&str> = full_command.collect();
 
         match (command, args.as_slice()) {
-            (Some("exit"), [exit_code, ..]) => std::process::exit(exit_code.parse().or(-1)),
+            (Some("exit"), [exit_code, ..]) => std::process::exit(exit_code.parse().unwrap_or(-1)),
             (Some("echo"), [_, ..]) => println!("{}", args.join(" ")),
             (Some("type"), [cmd, ..]) => {
                 let msg = type_buildin(cmd);
