@@ -27,7 +27,7 @@ fn find_exec_in_path(name: &str) -> Option<String> {
 fn type_buildin(name: &str) -> String {
     if let Some(first) = name.split_whitespace().next() {
         if ["echo", "exit", "type"].contains(&first) {
-            return format!("{} is a shell buildin", name);
+            return format!("{} is a shell builtin", name);
         }
     }
 
@@ -38,20 +38,15 @@ fn type_buildin(name: &str) -> String {
     format!("{} not found", name)
 }
 
-fn try_call(command: &str, arg1: &str) {
-    if let Some(path) = find_exec_in_path(command) {
-        let output = Command::new(command)
-            .arg(arg1)
-            .output()
-            .expect("Failed to execute command");
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            println!("{}", stdout);
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            println!("{}", stderr);
-        }
-    }
+fn try_call(command: &str, arg1: &str) -> Result<(), String> {
+    let mut output = Command::new(command)
+        .arg(arg1)
+        .spawn()
+        .map_err(|err| err.to_string())?;
+
+    output.wait().map_err(|err| err.to_string())?;
+
+    Ok(())
 }
 
 fn main() {
@@ -79,7 +74,7 @@ fn main() {
                 let msg = type_buildin(cmd);
                 println!("{}", msg);
             }
-            (Some(cmd), [arg1, ..]) => try_call(cmd, arg1),
+            (Some(cmd), [arg1, ..]) => try_call(cmd, arg1).unwrap(),
             _ => println!("{}: command not found", input.trim()),
         }
     }
