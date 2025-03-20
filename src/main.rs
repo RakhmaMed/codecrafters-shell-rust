@@ -40,7 +40,7 @@ fn type_buildin(name: &str) -> String {
 
 fn try_call(command: &str, arg1: &str) {
     if let Some(path) = find_exec_in_path(command) {
-        let output = Command::new(path)
+        let output = Command::new(command)
             .arg(arg1)
             .output()
             .expect("Failed to execute command");
