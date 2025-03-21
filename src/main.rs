@@ -1,7 +1,6 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 use std::process::Command;
 
 fn find_exec_in_fs(path: &str, name: &str) -> io::Result<String> {
@@ -51,7 +50,13 @@ fn try_call(command: &str, arg1: &str) -> Result<(), String> {
 }
 
 fn change_dir(path: &str) {
-    if env::set_current_dir(Path::new(path)).is_err() {
+    let path = if path == "~" {
+        env::var("HOME").unwrap()
+    } else {
+        path.to_string()
+    };
+
+    if env::set_current_dir(&path).is_err() {
         println!("cd: {}: No such file or directory", path);
     }
 }
