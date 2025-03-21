@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 
 fn find_exec_in_fs(path: &str, name: &str) -> io::Result<String> {
@@ -26,7 +27,7 @@ fn find_exec_in_path(name: &str) -> Option<String> {
 
 fn type_buildin(name: &str) -> String {
     if let Some(first) = name.split_whitespace().next() {
-        if ["echo", "exit", "type", "pwd"].contains(&first) {
+        if ["echo", "exit", "type", "pwd", "cd"].contains(&first) {
             return format!("{} is a shell builtin", name);
         }
     }
@@ -47,6 +48,12 @@ fn try_call(command: &str, arg1: &str) -> Result<(), String> {
     output.wait().map_err(|err| err.to_string())?;
 
     Ok(())
+}
+
+fn change_dir(path: &str) {
+    if env::set_current_dir(Path::new(path)).is_err() {
+        println!("cd: {}: No such file or directory", path);
+    }
 }
 
 fn main() {
@@ -71,6 +78,7 @@ fn main() {
             (Some("exit"), [exit_code, ..]) => std::process::exit(exit_code.parse().unwrap_or(-1)),
             (Some("echo"), [_, ..]) => println!("{}", args.join(" ")),
             (Some("pwd"), []) => println!("{}", env::current_dir().unwrap_or_default().display()),
+            (Some("cd"), [path, ..]) => change_dir(path),
             (Some("type"), [cmd, ..]) => {
                 let msg = type_buildin(cmd);
                 println!("{}", msg);
