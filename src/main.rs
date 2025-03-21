@@ -26,7 +26,7 @@ fn find_exec_in_path(name: &str) -> Option<String> {
 
 fn type_buildin(name: &str) -> String {
     if let Some(first) = name.split_whitespace().next() {
-        if ["echo", "exit", "type"].contains(&first) {
+        if ["echo", "exit", "type", "pwd"].contains(&first) {
             return format!("{} is a shell builtin", name);
         }
     }
@@ -70,6 +70,7 @@ fn main() {
         match (command, args.as_slice()) {
             (Some("exit"), [exit_code, ..]) => std::process::exit(exit_code.parse().unwrap_or(-1)),
             (Some("echo"), [_, ..]) => println!("{}", args.join(" ")),
+            (Some("pwd"), []) => println!("{}", env::current_dir().unwrap_or_default().display()),
             (Some("type"), [cmd, ..]) => {
                 let msg = type_buildin(cmd);
                 println!("{}", msg);
