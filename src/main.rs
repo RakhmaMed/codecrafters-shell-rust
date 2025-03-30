@@ -6,41 +6,46 @@ use std::os::unix::process::CommandExt;
 
 // Function to parse arguments respecting single quotes
 fn parse_arguments(input_args: &str) -> Result<Vec<String>, String> {
+    const BACKSLASH: char = '\\';
+    const SINGLE_QUOTE: char = '\'';
+    const DOUBLE_QUOTE: char = '"';
+    
     let mut args: Vec<String> = Vec::new();
     let mut current_arg = String::new();
     let mut in_double_quotes = false;
     let mut in_single_quotes = false;
     let mut chars = input_args.chars().peekable();
+    let mut prev_char = '\0';
 
     while let Some(c) = chars.next() {
         match c {
-            '\'' => {
-                if in_double_quotes {
-                    current_arg.push('\'');
+            SINGLE_QUOTE => {
+                if prev_char == BACKSLASH || in_double_quotes{
+                    current_arg.push(SINGLE_QUOTE);
                 } else {
                     // Togle quote state. Don't add the quote itself to the argument.
                     in_single_quotes = !in_single_quotes;
                 }
             }
-            '"' => {
-                if in_single_quotes {
-                    current_arg.push('"');
+            DOUBLE_QUOTE => {
+                if prev_char == BACKSLASH || in_single_quotes {
+                    current_arg.push(DOUBLE_QUOTE);
                 } else {
                     in_double_quotes = !in_double_quotes;
                 }
             }
-            c if c.is_whitespace() && !in_single_quotes && !in_double_quotes => {
-                // If we hit whitespace outside quotes, it's a delimiter
-                if !current_arg.is_empty() {
-                    args.push(std::mem::take(&mut current_arg)); // Push the completed arg
+            BACKSLASH => {
+                if in_double_quotes || in_single_quotes {
+                    current_arg.push(c);
                 }
-                // Skip any subsequent whitespace
-                while let Some(&next_char) = chars.peek() {
-                    if next_char.is_whitespace() {
-                        chars.next();
-                    } else {
-                        break;
-                    }
+            }
+            c if c.is_whitespace() && !in_single_quotes && !in_double_quotes => {
+                if prev_char == BACKSLASH {
+                    current_arg.push(c);
+                } else if prev_char.is_whitespace() {
+                    // Do nothing
+                } else if !current_arg.is_empty() { // If we hit whitespace outside quotes, it's a delimiter
+                    args.push(std::mem::take(&mut current_arg)); // Push the completed arg
                 }
             }
             _ => {
@@ -48,6 +53,7 @@ fn parse_arguments(input_args: &str) -> Result<Vec<String>, String> {
                 current_arg.push(c);
             }
         }
+        prev_char = c;
     }
 
     // Add the last argument if it wasn't teminated by whitespace
