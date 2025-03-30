@@ -6,25 +6,37 @@ use std::os::unix::process::CommandExt;
 
 // Function to parse arguments respecting single quotes
 fn parse_arguments(input_args: &str) -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
+    let mut args: Vec<String> = Vec::new();
     let mut current_arg = String::new();
-    let mut in_quotes = false;
+    let mut in_double_quotes = false;
+    let mut in_single_quotes = false;
     let mut chars = input_args.chars().peekable();
 
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
-                // Toggle quote state. Don't add the quote itself to the argument.
-                in_quotes = !in_quotes;
+                if in_double_quotes {
+                    current_arg.push('\'');
+                } else {
+                    // Togle quote state. Don't add the quote itself to the argument.
+                    in_single_quotes = !in_single_quotes;
+                }
             }
-            c if c.is_whitespace() && !in_quotes => {
-                // If we hit whitespace outside quoutes, it's a delimeter
+            '"' => {
+                if in_single_quotes {
+                    current_arg.push('"');
+                } else {
+                    in_double_quotes = !in_double_quotes;
+                }
+            }
+            c if c.is_whitespace() && !in_single_quotes && !in_double_quotes => {
+                // If we hit whitespace outside quotes, it's a delimiter
                 if !current_arg.is_empty() {
                     args.push(std::mem::take(&mut current_arg)); // Push the completed arg
                 }
                 // Skip any subsequent whitespace
-                while let Some(&next_c) = chars.peek() {
-                    if next_c.is_whitespace() {
+                while let Some(&next_char) = chars.peek() {
+                    if next_char.is_whitespace() {
                         chars.next();
                     } else {
                         break;
@@ -32,18 +44,19 @@ fn parse_arguments(input_args: &str) -> Result<Vec<String>, String> {
                 }
             }
             _ => {
+                // Any other character (or whitespace inside quotes) is part of the current arg
                 current_arg.push(c);
             }
         }
     }
 
-    // Add the last argument if it wasn't terminated by whitespace
+    // Add the last argument if it wasn't teminated by whitespace
     if !current_arg.is_empty() {
         args.push(current_arg);
     }
 
     // Check for unterminated quotes
-    if in_quotes {
+    if in_double_quotes || in_single_quotes {
         Err("Unterminated single quote in arguments".to_string())
     } else {
         Ok(args)
