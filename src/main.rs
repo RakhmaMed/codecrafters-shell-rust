@@ -4,11 +4,12 @@ use std::io::{self, Write};
 use std::process::Command;
 use std::os::unix::process::CommandExt;
 
+const BACKSLASH: char = '\\';
+const SINGLE_QUOTE: char = '\'';
+const DOUBLE_QUOTE: char = '"';
+
 // Function to parse arguments respecting single quotes
 fn parse_arguments(input_args: &str) -> Result<Vec<String>, String> {
-    const BACKSLASH: char = '\\';
-    const SINGLE_QUOTE: char = '\'';
-    const DOUBLE_QUOTE: char = '"';
     
     let mut args: Vec<String> = Vec::new();
     let mut current_arg = String::new();
@@ -51,7 +52,7 @@ fn parse_arguments(input_args: &str) -> Result<Vec<String>, String> {
                 } else {
                     continue;
                 };
-                
+
                 current_arg.push(ch);
             }
             c if c.is_whitespace() && !in_single_quotes && !in_double_quotes => {
@@ -274,40 +275,34 @@ fn main() {
             break;
         }
 
-        let trimmed_input = input.trim();
-        if trimmed_input.is_empty() {
+        let input = input.trim();
+        if input.is_empty() {
             continue;
         }
 
-        // Separate command from the rest of the input
-        let command_name;
-        let args_part;
-
-        if let Some(first_space_idx) = trimmed_input.find(char::is_whitespace) {
-            command_name = &trimmed_input[..first_space_idx];
-            args_part = trimmed_input[first_space_idx..].trim_start();
-        } else {
-            // No spaces, command is the whole input, no args part
-            command_name = trimmed_input;
-            args_part = "";
-        }
-
-        // Parse the arguments part using our new function
-        let args: Vec<String> = match parse_arguments(args_part) {
-            Ok(parsed_args) => parsed_args,
+        let tokens: Vec<String> = match parse_arguments(input) {
+            Ok(parsed_tokens) => {
+                if parsed_tokens.is_empty() {
+                    // If parsing results in nothing (e.g. input was just quotes), continue
+                    continue;
+                }
+                parsed_tokens
+            }
             Err(e) => {
                 println!("Parse error: {}", e);
                 continue; // Skip to next command on parse error
             }
         };
 
-        match command_name {
+        let (command_name, args) = tokens.split_first().unwrap(); // Safe dut to empty check above
+
+        match command_name.as_str() {
             "exit" => {
                 // Default exit code 0 if not specified or invalid
                 let code = args.get(0).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                 std::process::exit(code);
             }
-            "echo" => handle_echo(&args), // Pass the parsed String args
+            "echo" => handle_echo(args), // Pass the parsed String args
             "pwd" => {
                 if args.is_empty() {
                     match env::current_dir() {
@@ -332,7 +327,7 @@ fn main() {
                 if args.len() == 1 {
                     println!("{}", type_buildin(&args[0]));
                 } else {
-                    println!("type: requieres exactly one argument");
+                    println!("type: requires exactly one argument");
                 }
             }
             // Handle external commands
@@ -341,7 +336,7 @@ fn main() {
                 match find_exec_in_path(cmd) {
                     Some(full_path) => {
                         // Call try_call with the full path and parsed args
-                        if let Err(e) = try_call(cmd, &full_path, &args) {
+                        if let Err(e) = try_call(cmd, &full_path, args) {
                             println!("{}", e); // Print execution errors
                         }
                     }
