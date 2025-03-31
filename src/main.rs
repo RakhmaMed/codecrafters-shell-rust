@@ -1,20 +1,24 @@
-#![allow(clippy::comparison_to_empty)] // Allow compating String to "" for specific error handling
+#![allow(clippy::comparison_to_empty)] // Allow Err("") for external command failure status
 
 use std::env;
-use std::fs;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
-#[cfg(unix)] // for arg0
-use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt; // For arg0
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt; // For execute bits
 use std::process::{Command, Stdio};
 
-// --- Argument Parsing (with backslash fox) ---
-
+// --- Constants ---
 const BACKSLASH: char = '\\';
 const SINGLE_QUOTE: char = '\'';
 const DOUBLE_QUOTE: char = '"';
 
-// Function to parse arguments respecting single quotes
+// --- Argument Parsing ---
+
+/// Parses a command line string into arguments, respecting shell quoting and escaping.
+/// Handles single quotes (''), double quotes (""), and backslash (\) escapes.
+/// Returns Err on unterminated quotes.
 fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = Vec::new();
     let mut current_arg = String::new();
@@ -26,78 +30,60 @@ fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
         match c {
             SINGLE_QUOTE => {
                 if in_double_quotes {
-                    current_arg.push(SINGLE_QUOTE);
+                    current_arg.push(c);
                 } else {
-                    // Togle quote state. Don't add the quote itself to the argument.
-                    in_single_quotes = !in_single_quotes;
+                    in_single_quotes = !in_single_quotes; // Toggle state, don't add quote
                 }
             }
             DOUBLE_QUOTE => {
                 if in_single_quotes {
-                    current_arg.push(DOUBLE_QUOTE);
+                    current_arg.push(c);
                 } else {
-                    in_double_quotes = !in_double_quotes;
+                    in_double_quotes = !in_double_quotes; // Toggle state, don't add quote
                 }
             }
             BACKSLASH => {
-                // Peek at the next character for escape sequence handling
-                let next_char_opt = chars.peek().copied(); // Use copied for convernience
-
+                // Backslash behavior depends on quoting context
+                let next_char_opt = chars.peek().copied();
                 let ch_to_push = if in_single_quotes {
-                    // Inside single quoutes, backslash is literal unless escaping a signle quoute itself?
-                    // Standard sh: No escapes inside single quotes. Let's stick to that.
-                    c
+                    c // Literal backslash inside single quotes
                 } else if in_double_quotes {
-                    // Inside double quotes, only certain characters are escaped by backslash
-                    if let Some(next_char) = next_char_opt {
-                        match next_char {
-                            '$' | '`' | '"' | '\\' => {
-                                chars.next(); // Consume the escaped character
-                                next_char
-                            }
-                            _ => c, // Backslash is literal otherwise inside double quotes
+                    // Limited escaping inside double quotes
+                    if let Some(next) = next_char_opt {
+                        match next {
+                            '$' | '`' | '"' | '\\' => { chars.next(); next } // Consume escaped char
+                            _ => c, // Literal backslash otherwise
                         }
-                    } else {
-                        c // Backslash at the very end of input inside double quoutes
-                    }
+                    } else { c } // Literal backslash at end
                 } else {
-                    // Outside quotes, backslash escapes the next character
-                    if let Some(next_char) = next_char_opt {
-                        chars.next(); // Consume the escaped character
-                        next_char
-                    } else {
-                        c // Backslash at the very end of input outside quotes
-                    }
+                    // Unquoted: escape next char, or literal backslash if at end
+                    if let Some(next) = next_char_opt { chars.next(); next } else { c }
                 };
                 current_arg.push(ch_to_push);
             }
             ws if ws.is_whitespace() && !in_single_quotes && !in_double_quotes => {
-                // Whitespace outside quotes acts as a delimiter
+                // Whitespace outside quotes delimits arguments
                 if !current_arg.is_empty() {
-                    args.push(std::mem::take(&mut current_arg)); // Push the completed arg
+                    args.push(std::mem::take(&mut current_arg));
                 }
-                // Skip consecutive whitespace
-                while let Some(&next_char) = chars.peek() {
-                    if next_char.is_whitespace() {
-                        chars.next();
-                    } else {
-                        break;
-                    }
+                // Consume subsequent whitespace
+                while chars.peek().map_or(false, |ch| ch.is_whitespace()) {
+                    chars.next();
                 }
             }
             _ => {
-                // Any other character is part of the current arg
+                // Any other character is part of the current argument
                 current_arg.push(c);
             }
         }
     }
 
-    // Add the last argument if it wasn't teminated by whitespace
+    // Add the last argument if any
     if !current_arg.is_empty() {
         args.push(current_arg);
     }
 
-    // Check for unterminated quotes
+    // Check for parsing errors (unclosed quotes)
     if in_double_quotes {
         Err("Unterminated double quote in arguments".to_string())
     } else if in_single_quotes {
@@ -107,119 +93,92 @@ fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
     }
 }
 
-// Find
+// --- Command Searching ---
+
+/// Searches a single directory for an executable file name. Checks execute bits on Unix.
+/// Skips directories that are NotFound or inaccessible, returns other IO errors.
 fn find_exec_in_dir(dir_path: &str, name: &str) -> io::Result<Option<String>> {
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
-        // Ignore directories in PATH that don't exist or aren't directories
-        Err(e) if e.kind() == ErrorKind::NotFound /* || e.kind() == ErrorKind::NotADirectory */ => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None), // Skip non-existent dirs in PATH
+        Err(e) => return Err(e), // Propagate other errors
     };
 
     for entry_result in entries {
-        // Handle errors reading specific entries within a directory
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(_) => {
-                // eprintln!("shell: warning: error reading entry in directory '{}': {}", dir_path, e);
-                continue; // Skip this entry, try others
-            }
-        };
-
-        if entry.file_name().to_string_lossy() == name {
-            let path = entry.path();
-            // Handle errors getting meadata for a spceific file
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        // Check execute permission for user, group, or other
-                        if (metadata.permissions().mode() & 0o111) != 0 {
-                            return Ok(Some(path.to_string_lossy().into_owned()));
+        if let Ok(entry) = entry_result { // Ignore errors reading specific entries
+            if entry.file_name().to_string_lossy() == name {
+                if let Ok(metadata) = entry.metadata() { // Ignore errors getting metadata
+                    if metadata.is_file() {
+                        #[cfg(unix)]
+                        {
+                            // Check execute permission (user, group, or other)
+                            if (metadata.permissions().mode() & 0o111) != 0 {
+                                return Ok(Some(entry.path().to_string_lossy().into_owned()));
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            // Assume file is executable on non-Unix
+                             return Ok(Some(entry.path().to_string_lossy().into_owned()));
                         }
                     }
-                    #[cfg(not(unix))]
-                    {
-                        // Basic check for non-unix: just check if it's a file
-                        return Ok(Some(path.to_string_lossy().into_owned()));
-                    }
                 }
-            } else {
-                eprintln!(
-                    "shell: warning: could not get metadata for '{}'",
-                    path.display()
-                );
             }
         }
     }
-
     Ok(None) // Not found in this directory
 }
 
-// Find an executable in PATHs
+/// Finds an executable: checks direct path if `name` contains '/', otherwise searches PATH env var.
 fn find_exec_in_path(name: &str) -> Option<String> {
-    // If name contains '/', treat it as a direct path attempt
     if name.contains('/') {
-        // If it's already a path, check directly (basic check)
+        // Direct path check
         if let Ok(metadata) = fs::metadata(name) {
             if metadata.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if (metadata.permissions().mode() & 0o111) != 0 {
-                        return Some(name.to_string());
-                    }
+                #[cfg(unix)] {
+                    if (metadata.permissions().mode() & 0o111) != 0 { return Some(name.to_string()); }
                 }
-                #[cfg(not(unix))]
-                {
+                #[cfg(not(unix))] {
                     return Some(name.to_string());
                 }
             }
         }
-        // Direct path provided but not a valid executable file
-        return None;
+        return None; // Direct path invalid or not found
     }
 
-    // Search in PATH environment variable
+    // Search PATH
     if let Ok(path_var) = env::var("PATH") {
         for dir in path_var.split(':').filter(|d| !d.is_empty()) {
             match find_exec_in_dir(dir, name) {
                 Ok(Some(full_path)) => return Some(full_path),
-                Ok(None) => continue, // Not found in this dir
-                Err(_) => {
-                    // Optionally log fs errors for specific dirs, but don't halt search
-                    // eprintln!("shell: warning: error searching PATH directory '{}': {}", dir, e);
-                    continue;
-                }
+                Ok(None) => continue, // Check next directory
+                Err(_) => continue, // Ignore errors searching specific PATH dirs
             }
         }
     }
 
-    None // Not found in PATH
+    None // Not found
 }
 
-// --- Builtin Commands ---
-// Consistent Return type: Result<Option<String>, String>
-// Ok(Some(output)) -> Success, print this output to stdout
-// Ok(None)         -> Success, no output to print (e.g., cd, or output redirected)
-// Err(message)     -> Failure, print this message to stderr (non-empty message)
-// Err("")          -> Failure (non-zero exit), stderr already handled via inherit
+// --- Builtin Command Handlers ---
+// Convention: Result<Option<String>, String>
+// Ok(Some(output)): Success, print output (unless redirected)
+// Ok(None):          Success, no output to print (cd, redirected external)
+// Err(message):      Failure (built-in/shell), print message to stderr (unless redirected)
+// Err(""):           Failure (external non-zero exit), shell prints nothing further.
 
 fn handle_echo(args: &[String]) -> Result<Option<String>, String> {
-    // Standard echo adds a newline
     Ok(Some(format!("{}\n", args.join(" "))))
 }
 
 fn handle_pwd(_args: &[String]) -> Result<Option<String>, String> {
-    // Ignore args for standard pwd behavior
     match env::current_dir() {
         Ok(dir) => Ok(Some(format!("{}\n", dir.display()))),
         Err(e) => Err(format!("pwd: error getting current directory: {}", e)),
     }
 }
 
-// Helper for handle_type - determines the type information string
+/// Helper: Generates the string for the 'type' command.
 fn type_info_string(name: &str) -> String {
     if ["echo", "exit", "type", "pwd", "cd"].contains(&name) {
         format!("{} is a shell builtin", name)
@@ -231,342 +190,316 @@ fn type_info_string(name: &str) -> String {
 }
 
 fn handle_type(args: &[String]) -> Result<Option<String>, String> {
-    match args.iter().as_slice() {
+    match args {
         [name] => Ok(Some(format!("{}\n", type_info_string(name)))),
         [] => Err("type: missing argument".to_string()),
         _ => Err("type: too many arguments".to_string()),
     }
 }
 
-// Helper for handle_cd - performs the directory change
+/// Helper: Performs the directory change for `cd`. Handles `~`.
 fn change_dir(target_path_str: &str) -> Result<(), String> {
-    // Resilt "~" to home directory
-    let target_path = if target_path_str == "~" || target_path_str == "~/" {
-        env::var("HOME").map_err(|_| "cd: HOME environment variable not set".to_string())?
+    // Expand `~` or `~/`
+    let target_path = if target_path_str == "~" || target_path_str.starts_with("~/") {
+        match env::var("HOME") {
+            Ok(home_dir) => {
+                if target_path_str.starts_with("~/") {
+                    let mut path = std::path::PathBuf::from(home_dir);
+                    path.push(&target_path_str[2..]); // Append path after '~/'
+                    path.to_string_lossy().into_owned()
+                } else {
+                    home_dir // Just HOME
+                }
+            }
+            Err(_) => return Err("cd: HOME environment variable not set".to_string()),
+        }
     } else {
         target_path_str.to_string()
     };
 
-    // Atempt to change directory
-    env::set_current_dir(&target_path)
-        .map_err(|_| format!("cd: {}: No such file or directory", target_path))
+    // Attempt change and map specific errors to expected messages
+    env::set_current_dir(&target_path).map_err(|e| {
+        // *** FIX: Format error message based on Kind to match test expectation ***
+        let err_description = match e.kind() {
+            ErrorKind::NotFound => "No such file or directory".to_string(),
+            ErrorKind::PermissionDenied => "Permission denied".to_string(),
+            // ErrorKind::NotADirectory => "Not a directory".to_string(),
+            // Fallback for other IO errors
+            _ => e.to_string(),
+        };
+        format!("cd: {}: {}", target_path, err_description)
+    })
 }
 
 fn handle_cd(args: &[String]) -> Result<Option<String>, String> {
-    let target_path_str = match args.iter().as_slice() {
-        [] => "~", // Default to home directory
+    let target_path_str = match args {
+        [] => "~", // Default to home
         [path] => path.as_str(),
         _ => return Err("cd: too many arguments".to_string()),
     };
-    // change_dir returns Result<(), String>. Map Ok(()) to Ok(None).
+    // Map Ok(()) to Ok(None) for handler convention
     change_dir(target_path_str).map(|_| None)
 }
 
+// --- External Command Execution ---
+
+/// Executes an external command, handling args, stdio redirection, and waiting.
+/// Returns Ok(None) on success (exit 0), Err("") on failure (non-zero exit),
+/// or Err(message) on spawn/wait errors.
 fn execute_external_command(
-    command_name: &str,
-    command_path: &str,
+    command_name: &str, // For arg0 and errors
+    command_path: &str, // Full path to exec
     args: &[String],
-    stdout_redirection_file: Option<&str>, // Renamed for clarity
-    stderr_redirection_file: Option<&str>, // New parameter
+    stdout_redirect_file: Option<&str>,
+    stderr_redirect_file: Option<&str>,
 ) -> Result<Option<String>, String> {
-    // Return type remains the same
-
     let mut command = Command::new(command_path);
-
-    // Conditionally set argv[0] on Unix systems
-    #[cfg(unix)]
-    {
-        command.arg0(command_name);
-    }
-    // Add the rest of the arguments
+    #[cfg(unix)] { command.arg0(command_name); } // Set argv[0] on Unix
     command.args(args);
 
-    // --- Configure stdout ---
-    let mut stdout_redir_file_handle: Option<File> = None; // Keep handle alive
-    let stdout_config = match stdout_redirection_file {
-        Some(filename) => {
-            let file = File::create(filename).map_err(|e| {
-                format!("failed to open stdout redirect file '{}': {}", filename, e)
-            })?;
-            let stdio_handle = file
-                .try_clone()
-                .map_err(|e| format!("failed to clone stdout file handle for redirect: {}", e))?;
-            stdout_redir_file_handle = Some(file); // Store original handle
-            Stdio::from(stdio_handle)
-        }
-        None => Stdio::piped(), // Capture stdout if not redirecting
-    };
-    command.stdout(stdout_config);
+    // --- Configure Stdio ---
+    let mut stdout_handle: Option<File> = None; // Keep handles alive until wait()
+    let mut stderr_handle: Option<File> = None;
 
-    // --- Configure stderr ---
-    let mut stderr_redir_file_handle: Option<File> = None; // Keep handle alive
-    let stderr_config = match stderr_redirection_file {
-        Some(filename) => {
-            let file = File::create(filename).map_err(|e| {
-                format!("failed to open stderr redirect file '{}': {}", filename, e)
-            })?;
-            let stdio_handle = file
-                .try_clone()
-                .map_err(|e| format!("failed to clone stderr file handle for redirect: {}", e))?;
-            stderr_redir_file_handle = Some(file); // Store original handle
-            Stdio::from(stdio_handle)
+    // Stdout: Redirect to file or pipe
+    let stdout_stdio = match stdout_redirect_file {
+        Some(filename) => match File::create(filename) {
+            Ok(file) => match file.try_clone() {
+                Ok(cloned) => { stdout_handle = Some(file); Stdio::from(cloned) }
+                Err(e) => return Err(format!("failed to clone stdout file handle: {}", e)),
+            }
+            Err(e) => return Err(format!("failed to open stdout redirect file '{}': {}", filename, e)),
         }
-        None => Stdio::inherit(), // Default: Inherit stderr if not redirecting
+        None => Stdio::piped(), // Pipe if not redirecting
     };
-    command.stderr(stderr_config);
+    command.stdout(stdout_stdio);
 
-    // Spawn the command
+    // Stderr: Redirect to file or inherit
+    let stderr_stdio = match stderr_redirect_file {
+        Some(filename) => match File::create(filename) {
+             Ok(file) => match file.try_clone() {
+                Ok(cloned) => { stderr_handle = Some(file); Stdio::from(cloned) }
+                Err(e) => return Err(format!("failed to clone stderr file handle: {}", e)),
+            }
+            Err(e) => return Err(format!("failed to open stderr redirect file '{}': {}", filename, e)),
+        }
+        None => Stdio::inherit(), // Inherit shell's stderr if not redirecting
+    };
+    command.stderr(stderr_stdio);
+
+    // --- Spawn and Wait ---
     let mut child = command.spawn().map_err(|e| {
-        if e.kind() == ErrorKind::NotFound {
-            format!("{}: command not found", command_name)
-        } else {
-            format!("failed to execute command '{}': {}", command_name, e)
+        match e.kind() {
+            ErrorKind::NotFound => format!("{}: command not found (spawn error)", command_name), // Should be rare
+            ErrorKind::PermissionDenied => format!("{}: Permission denied", command_name),
+            _ => format!("failed to execute command '{}': {}", command_name, e),
         }
     })?;
 
-    // Handle output / waiting
+    // Capture stdout only if it was piped
     let mut captured_stdout = String::new();
-    // Only read stdout if it was piped (i.e., not redirected to a file)
-    if stdout_redirection_file.is_none() {
+    if stdout_redirect_file.is_none() {
         if let Some(mut child_stdout) = child.stdout.take() {
-            // Reading can fail, report but proceed to wait for status
             if let Err(e) = child_stdout.read_to_string(&mut captured_stdout) {
-                // Use eprintln directly as this is an intermediate shell warning
-                // This warning itself won't be redirected by 2> applied to the child command.
+                // Non-fatal error reading pipe, warn but proceed
                 eprintln!("shell: warning: error reading command stdout pipe: {}", e);
             }
         }
     }
-    // Note: We are not capturing stderr if it was piped (we set it to inherit or file).
 
-    // Wait for the command to complete to get its exit status
-    let status = child
-        .wait()
-        .map_err(|e| format!("failed to wait for command '{}': {}", command_name, e))?;
+    // Wait for the command to finish and get exit status
+    let status = child.wait().map_err(|e| format!("failed to wait for command '{}': {}", command_name, e))?;
 
-    // Ensure file handles are dropped *after* the child process finishes.
-    drop(stdout_redir_file_handle);
-    drop(stderr_redir_file_handle);
+    // Ensure handles are dropped *after* wait()
+    drop(stdout_handle);
+    drop(stderr_handle);
 
-    // Check if stdout was captured and print it *before* determining Ok/Err based on status
-    let mut stdout_printed = false;
-    if stdout_redirection_file.is_none() && !captured_stdout.is_empty() {
-        // Stdout was piped (not redirected by >) and we captured something. Print it now.
+    // Print captured stdout if any *before* checking status
+    if !captured_stdout.is_empty() {
         print!("{}", captured_stdout);
-        // Flush stdout to ensure it's visible immediately
-        io::stdout()
-            .flush()
-            .unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
-        stdout_printed = true;
+        io::stdout().flush().unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
     }
 
-    // Determine final result based ONLY on exit status now
+    // --- Return status ---
     if status.success() {
-        // If success and we already printed captured stdout, return Ok(None).
-        // If success and stdout was redirected by >, return Ok(None).
-        Ok(None) // Simplified: Success means no further action needed from main regarding output.
+        Ok(None) // Success, output handled
     } else {
-        // Command failed (non-zero exit).
-        // Stdout (if captured) was already printed above.
-        // Stderr was handled via inheritance or redirection to file.
-        // Signal failure (non-zero exit) without the shell printing more error info.
-        Err(String::new())
+        Err(String::new()) // Failure (non-zero exit), signal shell not to print more errors
     }
 }
 
-// --- Main Loop ---
+// --- Main Loop Logic Extraction ---
+
+/// Parses redirection operators (>, 1>, 2>) from the end of a token list.
+/// Returns the remaining arguments and optional filenames for stdout/stderr redirection.
+fn parse_redirections(
+    args_slice: &[String]
+) -> (Vec<String>, Option<String>, Option<String>) {
+    let mut command_args = args_slice.to_vec(); // Clone to modify
+    let mut stdout_redirect_filename: Option<String> = None;
+    let mut stderr_redirect_filename: Option<String> = None;
+
+    // Loop backwards checking for `op filename` patterns
+    loop {
+        let len = command_args.len();
+        if len < 2 { break; } // Need op + file
+
+        let op = &command_args[len - 2];
+        let filename = &command_args[len - 1];
+
+        match op.as_str() {
+            ">" | "1>" => {
+                stdout_redirect_filename = Some(filename.clone());
+                command_args.truncate(len - 2); // Remove op + file
+            }
+            "2>" => {
+                stderr_redirect_filename = Some(filename.clone());
+                command_args.truncate(len - 2); // Remove op + file
+            }
+            _ => break, // Not a redirection operator
+        }
+    }
+    (command_args, stdout_redirect_filename, stderr_redirect_filename)
+}
+
+/// Dispatches the command to the appropriate handler (built-in or external).
+fn dispatch_command(
+    command_name: &str,
+    command_args: &[String],
+    stdout_redirect_ref: Option<&str>,
+    stderr_redirect_ref: Option<&str>,
+) -> Result<Option<String>, String> {
+    match command_name {
+        // --- Built-in Commands ---
+        "exit" => {
+            let code = command_args.first().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            std::process::exit(code);
+        }
+        "echo" => handle_echo(command_args),
+        "pwd" => handle_pwd(command_args),
+        "cd" => handle_cd(command_args),
+        "type" => handle_type(command_args),
+        // --- External Command ---
+        cmd => match find_exec_in_path(cmd) {
+            Some(full_path) => execute_external_command(
+                cmd, &full_path, command_args, stdout_redirect_ref, stderr_redirect_ref
+            ),
+            None => Err(format!("{}: command not found", cmd)),
+        }
+    }
+}
+
+/// Handles the result from dispatch_command, printing output/errors appropriately
+/// respecting redirection settings.
+fn handle_command_result(
+    result: Result<Option<String>, String>,
+    stdout_redirect_ref: Option<&str>,
+    stderr_redirect_ref: Option<&str>,
+) {
+    match result {
+        Ok(Some(output_str)) => { // Success with output (built-in, or external without '>')
+            if let Some(filename) = stdout_redirect_ref {
+                // Redirect BUILT-IN output
+                match File::create(filename) {
+                    Ok(mut file) => {
+                       if let Err(e) = file.write_all(output_str.as_bytes()) {
+                           eprintln!("shell: error writing built-in stdout to '{}': {}", filename, e);
+                       }
+                    },
+                    Err(e) => eprintln!("shell: failed to open stdout redirect file '{}': {}", filename, e),
+                }
+                // Ensure stderr file exists if 2> also used
+                if let Some(err_f) = stderr_redirect_ref { if File::create(err_f).is_err() { /* ignore */ } }
+            } else {
+                // Print output to terminal stdout
+                print!("{}", output_str);
+                io::stdout().flush().unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
+                 // Ensure stderr file exists if 2> also used
+                if let Some(err_f) = stderr_redirect_ref { if File::create(err_f).is_err() { /* ignore */ } }
+            }
+        }
+        Ok(None) => { // Success, no direct output string (cd, external with '>', external no output)
+             // Ensure stderr file exists if 2> used
+             if let Some(err_f) = stderr_redirect_ref { if File::create(err_f).is_err() { /* ignore */ } }
+             // Stdout redirection for external commands was handled internally
+        }
+        Err(err_msg) => { // Command failed
+            if !err_msg.is_empty() { // Built-in or shell error (e.g., "not found", "cd failed")
+                // Handle stderr redirection for this error message
+                if let Some(filename) = stderr_redirect_ref {
+                     match File::create(filename) {
+                        Ok(mut file) => {
+                            if let Err(e) = writeln!(file, "{}", err_msg) {
+                                 eprintln!("shell: error writing error to stderr redirect file '{}': {}", filename, e);
+                            }
+                        },
+                        Err(e) => { // Failed to open redirect file, print original error to terminal
+                            eprintln!("shell: failed to open stderr redirect file '{}': {}", filename, e);
+                            eprintln!("{}", err_msg);
+                        }
+                    }
+                } else {
+                    // Print error to terminal stderr
+                    eprintln!("{}", err_msg);
+                }
+                // Ensure stdout file exists if > was used with a failed built-in/shell command
+                if let Some(out_f) = stdout_redirect_ref { if File::create(out_f).is_err() { /* ignore */ } }
+            }
+            // else: err_msg is empty, indicating external command failed (non-zero exit).
+            // Stderr/stdout were already handled by execute_external_command. Do nothing here.
+        }
+    }
+}
+
+
+// --- Refactored Main Shell Loop ---
 fn main() {
     loop {
+        // 1. Print prompt
         print!("$ ");
         io::stdout().flush().unwrap();
 
-        // Wait for user input
+        // 2. Read input
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
-            Ok(0) => {
-                // EOF detected
-                println!(); // Print a newline for clean exit
-                break;
-            }
-            Ok(_) => {} // Successfully read line
-            Err(e) => {
-                eprintln!("shell: input error: {}", e);
-                break; // Exit on read error
-            }
+            Ok(0) => { println!(); break; } // EOF
+            Ok(_) => {}
+            Err(e) => { eprintln!("shell: input error: {}", e); break; }
         }
 
-        let input = input.trim();
-        if input.is_empty() {
-            continue; // Show prompt again if input is only whitespace
-        }
+        // 3. Basic trimming and empty check
+        let trimmed_input = input.trim();
+        if trimmed_input.is_empty() { continue; }
 
-        // Parse tokens
-        let tokens: Vec<String> = match parse_tokens(input) {
-            Ok(parsed_token) if parsed_token.is_empty() => continue, // Input was only quotes, etc.
-            Ok(parsed_tokens) => parsed_tokens,
-            Err(e) => {
-                println!("Parse error: {}", e);
-                continue; // Skip to next command
-            }
+        // 4. Parse input into tokens
+        let tokens: Vec<String> = match parse_tokens(trimmed_input) {
+            Ok(parsed) if parsed.is_empty() => continue, // e.g., input was `""`
+            Ok(parsed) => parsed,
+            Err(e) => { eprintln!("shell: parse error: {}", e); continue; }
         };
+        let (command_name, args_slice) = tokens.split_first().unwrap(); // Safe due to empty check
 
-        // Safe unwrap due to empty check above
-        let (command_name, args_slice) = tokens.split_first().unwrap();
+        // 5. Parse redirections from arguments
+        let (command_args, stdout_redirect_filename, stderr_redirect_filename) =
+            parse_redirections(args_slice);
 
-        // --- Redirection Parsing (Handles >/>1/2> at the end) ---
-        let mut remaining_args = args_slice.to_vec(); // Clone args to modify
-        let mut stdout_redirect_filename: Option<String> = None;
-        let mut stderr_redirect_filename: Option<String> = None;
-
-        // Loop backwards through arguments checking for redirection operators
-        // This handles cases like `cmd arg1 > out.txt 2> err.txt` or `cmd arg1 2> err.txt > out.txt`
-        loop {
-            let len = remaining_args.len();
-            if len < 2 {
-                break; // Need at least operator + filename
-            }
-
-            let operator = &remaining_args[len - 2];
-            let filename = &remaining_args[len - 1];
-
-            match operator.as_str() {
-                ">" | "1>" => {
-                    // Silently overwrite previous stdout redirect if found again
-                    stdout_redirect_filename = Some(filename.clone());
-                    remaining_args.truncate(len - 2); // Remove processed args
-                }
-                "2>" => {
-                    // Silently overwrite previous stderr redirect if found again
-                    stderr_redirect_filename = Some(filename.clone());
-                    remaining_args.truncate(len - 2); // Remove processed args
-                }
-                _ => {
-                    // Last two args are not a recognized redirection, stop parsing redirects
-                    break;
-                }
-            }
-        }
-        // `remaining_args` now contains only the actual command arguments
-        let command_args = remaining_args;
-        // Get Option<&str> versions for passing to functions if needed
+        // Get temporary references for dispatching if filenames exist
         let stdout_redirect_ref = stdout_redirect_filename.as_deref();
         let stderr_redirect_ref = stderr_redirect_filename.as_deref();
-        // --- End Redirection Parsing ---
 
-        let result: Result<Option<String>, String> = match command_name.as_str() {
-            "exit" => {
-                // Use command_args which excludes redirection parts
-                let code = command_args
-                    .first()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
-                std::process::exit(code);
-            }
-            // Built-in handlers still only take command_args
-            "echo" => handle_echo(&command_args),
-            "pwd" => handle_pwd(&command_args),
-            "cd" => handle_cd(&command_args),
-            "type" => handle_type(&command_args),
-            // --- External Command ---
-            cmd => {
-                match find_exec_in_path(cmd) {
-                    Some(full_path) => {
-                        // Pass both stdout and stderr redirection filenames
-                        execute_external_command(
-                            cmd,
-                            &full_path,
-                            &command_args,
-                            stdout_redirect_ref, // Pass ref
-                            stderr_redirect_ref, // Pass ref
-                        )
-                    }
-                    None => Err(format!("{}: command not found", cmd)),
-                }
-            }
-        };
+        // 6. Dispatch command (built-in or external)
+        let result = dispatch_command(
+            command_name,
+            &command_args, // Use args *after* redirection parsing
+            stdout_redirect_ref,
+            stderr_redirect_ref,
+        );
 
-        // Handle command result (Output or Error)
-        // Handle command result (Output or Error)
-        match result {
-            Ok(Some(output_str)) => {
-                // Output received. Could be from:
-                // 1. Built-in success (e.g., echo, pwd).
-                // 2. External command success where stdout was piped/captured.
-                if let Some(filename) = stdout_redirect_ref {
-                    // Stdout redirection ('>') requested.
-                    // This indicates output from a BUILT-IN should be redirected.
-                    match File::create(filename) {
-                        Ok(mut file) => {
-                            if let Err(e) = file.write_all(output_str.as_bytes()) {
-                                eprintln!("shell: error writing built-in output to stdout redirect file '{}': {}", filename, e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "shell: failed to open stdout redirect file '{}': {}",
-                                filename, e
-                            );
-                        }
-                    }
-                    // Ensure stderr file exists if 2> was also used with a successful built-in
-                    if let Some(filename) = stderr_redirect_ref {
-                        if File::create(filename).is_err() { /* Optional warning */ }
-                    }
-                } else {
-                    // No stdout redirection ('>'). Print the output string directly to terminal.
-                    // (From successful built-in OR successful external command with captured stdout)
-                    print!("{}", output_str);
-                    io::stdout()
-                        .flush()
-                        .unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
-                    // Ensure stderr file exists if 2> was used (e.g. successful external cmd with 2>)
-                    if let Some(filename) = stderr_redirect_ref {
-                        if File::create(filename).is_err() { /* Optional warning */ }
-                    }
-                }
-            }
-            Ok(None) => {
-                // Command succeeded. No output string returned by execute_external_command/builtin handler.
-                // Means:
-                // 1. External command successfully redirected stdout via '>'. File writing completed internally.
-                // 2. Built-in command had no output (e.g., cd).
-                // We only need to ensure the *stderr* file exists if `2>` was specified.
-                if let Some(filename) = stderr_redirect_ref {
-                    // Ensure file exists (e.g., for `ls > out.txt 2> err.txt` or `cd 2> err.txt`)
-                    if File::create(filename).is_err() { /* Optional warning */ }
-                }
-                // *** DO NOT TOUCH stdout_redirect_ref file here ***
-            }
-            Err(err_msg) => {
-                // Command failed (external non-zero exit OR built-in returned Err)
-                // External command output/error (stdout print, stderr inherit/redirect) handled by execute_external_command.
-
-                if !err_msg.is_empty() {
-                    // Non-empty means a BUILT-IN command failed or shell error. Handle its stderr redirection.
-                    if let Some(filename) = stderr_redirect_ref {
-                        match File::create(filename) {
-                            // Create/truncate stderr file for built-in error
-                            Ok(mut file) => {
-                                if let Err(_) = writeln!(file, "{}", err_msg) { /* ... error handling ... */
-                                }
-                            }
-                            Err(_) => { /* ... error handling ... */ }
-                        }
-                    } else {
-                        // No stderr redirection for built-in error, print to terminal stderr.
-                        eprintln!("{}", err_msg);
-                    }
-                    // Ensure stdout file exists if > was specified when a built-in failed
-                    if let Some(filename) = stdout_redirect_ref {
-                        if File::create(filename).is_err() { /* Optional warning */ }
-                    }
-                }
-                // else: err_msg is empty (external command failed).
-                // Its stdout (if captured) was printed by execute_external_command.
-                // Its stdout/stderr redirection was handled via Stdio in execute_external_command.
-                // *** DO NOT TOUCH stdout_redirect_ref or stderr_redirect_ref files here ***
-            }
-        }
-        // match end
+        // 7. Handle the result (print output/errors, respect redirection)
+        handle_command_result(
+            result,
+            stdout_redirect_ref, // Pass refs again for result handling
+            stderr_redirect_ref,
+        );
     }
 }
