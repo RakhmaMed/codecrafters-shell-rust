@@ -1,9 +1,14 @@
+#![allow(clippy::comparison_to_empty)] // Allow compating String to "" for specific error handling
+
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Write, Read, ErrorKind};
+#[cfg(unix)] // for arg0
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+// --- Argument Parsing (with backslash fox) ---
 
 const BACKSLASH: char = '\\';
 const SINGLE_QUOTE: char = '\'';
@@ -35,32 +40,43 @@ fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
                 }
             }
             BACKSLASH => {
-                let ch = if let Some(&next_char) = chars.peek() {
-                    if in_single_quotes {
-                        c
-                    } else if in_double_quotes {
-                        if [BACKSLASH, '$', DOUBLE_QUOTE].contains(&next_char) {
-                            chars.next();
-                            next_char
-                        } else {
-                            c
+                // Peek at the next character for escape sequence handling
+                let next_char_opt = chars.peek().copied(); // Use copied for convernience
+
+                let ch_to_push = if in_single_quotes {
+                    // Inside single quoutes, backslash is literal unless escaping a signle quoute itself?
+                    // Standard sh: No escapes inside single quotes. Let's stick to that.
+                    c
+                } else if in_double_quotes {
+                    // Inside double quotes, only certain characters are escaped by backslash
+                    if let Some(next_char) = next_char_opt {
+                        match next_char {
+                            '$' | '`' | '"' | '\\' => {
+                                chars.next(); // Consume the escaped character
+                                next_char
+                            }
+                            _ => c, // Backslash is literal otherwise inside double quotes
                         }
                     } else {
-                        chars.next();
-                        next_char
+                        c // Backslash at the very end of input inside double quoutes
                     }
                 } else {
-                    continue;
+                    // Outside quotes, backslash escapes the next character
+                    if let Some(next_char) = next_char_opt {
+                        chars.next(); // Consume the escaped character
+                        next_char
+                    } else {
+                        c // Backslash at the very end of input outside quotes
+                    }
                 };
-
-                current_arg.push(ch);
+                current_arg.push(ch_to_push);
             }
-            c if c.is_whitespace() && !in_single_quotes && !in_double_quotes => {
+            ws if ws.is_whitespace() && !in_single_quotes && !in_double_quotes => {
+                // Whitespace outside quotes acts as a delimiter
                 if !current_arg.is_empty() {
-                    // If we hit whitespace outside quotes, it's a delimiter
                     args.push(std::mem::take(&mut current_arg)); // Push the completed arg
                 }
-
+                // Skip consecutive whitespace
                 while let Some(&next_char) = chars.peek() {
                     if next_char.is_whitespace() {
                         chars.next();
@@ -70,7 +86,7 @@ fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
                 }
             }
             _ => {
-                // Any other character (or whitespace inside quotes) is part of the current arg
+                // Any other character is part of the current arg
                 current_arg.push(c);
             }
         }
@@ -82,7 +98,9 @@ fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
     }
 
     // Check for unterminated quotes
-    if in_double_quotes || in_single_quotes {
+    if in_double_quotes {
+        Err("Unterminated double quote in arguments".to_string())
+    } else if in_single_quotes {
         Err("Unterminated single quote in arguments".to_string())
     } else {
         Ok(args)
@@ -90,326 +108,364 @@ fn parse_tokens(input_args: &str) -> Result<Vec<String>, String> {
 }
 
 // Find
-fn find_exec_in_fs(path: &str, name: &str) -> io::Result<String> {
-    for p in path.split(":") {
-        // Use metadata to check if if's a directory and handle potential errors
-        if let Ok(metadata) = fs::metadata(p) {
-            if !metadata.is_dir() {
-                continue; // Skip if not a directory
-            }
-        } else {
-            continue; // Skip if error reading metadata (e.g., path doesn't exist)
-        }
+fn find_exec_in_dir(dir_path: &str, name: &str) -> io::Result<Option<String>> {
+    let entries = match fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        // Ignore directories in PATH that don't exist or aren't directories
+        Err(e) if e.kind() == ErrorKind::NotFound /* || e.kind() == ErrorKind::NotADirectory */ => return Ok(None),
+        Err(e) => return Err(e),
+    };
 
-        if let Ok(entries) = fs::read_dir(p) {
-            // Handle potential read_dir error
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    // Handle potential entry error
-                    let filename = entry.file_name();
-                    // Ensure comparison works correctly (OsString to &str)
-                    if filename.to_string_lossy() == name {
-                        // Construct the full path
-                        let full_path = entry.path().to_string_lossy().into_owned();
-                        // Basic check if it's executable (more robust checks exist)
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.is_file()
-                                    && (metadata.permissions().mode() & 0o111) != 0
-                                {
-                                    return Ok(full_path);
-                                }
-                            }
-                        }
-                        #[cfg(not(unix))] // Basic check for non-unix
-                        {
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.is_file() {
-                                    return Ok(full_path); // Simplistic check non-unix
-                                }
-                            }
+    for entry_result in entries {
+        // Handle errors reading specific entries within a directory
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(_) => {
+                // eprintln!("shell: warning: error reading entry in directory '{}': {}", dir_path, e);
+                continue; // Skip this entry, try others
+            }   
+        };
+
+        if entry.file_name().to_string_lossy() == name {
+            let path = entry.path();
+            // Handle errors getting meadata for a spceific file
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        // Check execute permission for user, group, or other
+                        if (metadata.permissions().mode() & 0o111) != 0 {
+                            return Ok(Some(path.to_string_lossy().into_owned()));
                         }
                     }
+                    #[cfg(not(unix))]
+                    {
+                        // Basic check for non-unix: just check if it's a file
+                        return Ok(Some(path.to_string_lossy().into_owned()))
+                    }
                 }
+            } else {
+                eprintln!("shell: warning: could not get metadata for '{}'", path.display());
             }
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "Executable not found in path",
-    ))
+    Ok(None) // Not found in this directory
 }
 
 // Find an executable in PATHs
 fn find_exec_in_path(name: &str) -> Option<String> {
+    // If name contains '/', treat it as a direct path attempt
     if name.contains('/') {
         // If it's already a path, check directly (basic check)
         if let Ok(metadata) = fs::metadata(name) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.is_file() && (metadata.permissions().mode() & 0o111) != 0 {
-                    return Some(name.to_string());
+            if metadata.is_file() {
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt;
+                    if (metadata.permissions().mode() & 0o111) != 0 {
+                        return Some(name.to_string());
+                    }
                 }
-            }
-            #[cfg(not(unix))]
-            {
-                if metadata.is_file() {
+                #[cfg(not(unix))] {
                     return Some(name.to_string());
                 }
             }
         }
-        return None; // Not a valid executable path
+        // Direct path provided but not a valid executable file
+        return None;
     }
 
-    let path_var = env::var("PATH").ok()?;
-    find_exec_in_fs(&path_var, name).ok()
+    // Search in PATH environment variable
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            match find_exec_in_dir(dir, name) {
+                Ok(Some(full_path)) => return Some(full_path),
+                Ok(None) => continue, // Not found in this dir
+                Err(_) => {
+                    // Optionally log fs errors for specific dirs, but don't halt search
+                    // eprintln!("shell: warning: error searching PATH directory '{}': {}", dir, e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    None // Not found in PATH
 }
 
-fn type_buildin(name: &str) -> String {
-    // Check builtins first
+
+// --- Builtin Commands ---
+// Consistent Return type: Result<Option<String>, String>
+// Ok(Some(output)) -> Success, print this output to stdout
+// Ok(None)         -> Success, no output to print (e.g., cd, or output redirected)
+// Err(message)     -> Failure, print this message to stderr (non-empty message)
+// Err("")          -> Failure (non-zero exit), stderr already handled via inherit
+
+fn handle_echo(args: &[String]) -> Result<Option<String>, String> {
+    // Standard echo adds a newline
+    Ok(Some(format!("{}\n", args.join(" "))))
+}
+
+fn handle_pwd(_args: &[String]) -> Result<Option<String>, String> {
+    // Ignore args for standard pwd behavior
+    match env::current_dir() {
+        Ok(dir) => Ok(Some(format!("{}\n", dir.display()))),
+        Err(e) => Err(format!("pwd: error getting current directory: {}", e)),
+    }
+}
+
+// Helper for handle_type - determines the type information string
+fn type_info_string(name: &str) -> String {
     if ["echo", "exit", "type", "pwd", "cd"].contains(&name) {
-        return format!("{} is a shell builtin", name);
+        format!("{} is a shell builtin", name)
+    } else if let Some(full_path) = find_exec_in_path(name) {
+        format!("{} is {}", name, full_path)
+    } else {
+        format!("{}: not found", name)
     }
-
-    // Check executable in PATH
-    if let Some(full_path) = find_exec_in_path(name) {
-        return format!("{} is {}", name, full_path);
-    }
-
-    format!("{} not found", name)
 }
 
-/// Executes a command, captures its output, and return stdout on success.
-/// 
-/// On Unix it sets argv[0] using `command_name`. On other platforms,
-/// argv[0] will typically be `command_path`.
-/// 
-/// # Arguments
-/// * `command_name` - The name to use for argv[0] (primarily on Unix).
-/// * `command_path` - The actual path to the executable file.
-/// * `args` - A slice of strings representing the arguments (argv[1], ...).
-/// 
-/// # Returns
-/// * `Ok(String)` containing the captured standard output if he command runs successfully (exit code 0).
-/// * `Err(String)` containing an error message if the command fails to spawn,
-///   doesn't execute sucessfully (non-zero exit code), or if stdouut is not valid UTF-8.
-fn try_call(command_name: &str, command_path: &str, args: &[String]) -> Result<String, String> {
-    let mut command_proc = Command::new(command_path);
+fn handle_type(args: &[String]) -> Result<Option<String>, String> {
+    match args.iter().as_slice() {
+        [name] => Ok(Some(format!("{}\n", type_info_string(name)))),
+        [] => Err("type: missing argument".to_string()),
+        _ => Err("type: too many arguments".to_string()),
+    }
+}
+
+// Helper for handle_cd - performs the directory change
+fn change_dir(target_path_str: &str) -> Result<(), String> {
+    // Resilt "~" to home directory
+    let target_path = if target_path_str == "~" || target_path_str == "~/" {
+        env::var("HOME").map_err(|_| "cd: HOME environment variable not set".to_string())?
+    } else {
+        target_path_str.to_string()
+    };
+
+    // Atempt to change directory
+    env::set_current_dir(&target_path)
+        .map_err(|_| format!("cd: {}: No such file or directory", target_path))
+}
+
+fn handle_cd(args: &[String]) -> Result<Option<String>, String> {
+    let target_path_str  = match args.iter().as_slice() {
+        [] => "~", // Default to home directory
+        [path] => path.as_str(),
+        _ => return Err("cd: too many arguments".to_string())
+    };
+    // change_dir returns Result<(), String>. Map Ok(()) to Ok(None).
+    change_dir(target_path_str).map(|_| None)
+}
+
+
+fn execute_external_command(
+    command_name: &str,
+    command_path: &str,
+    args: &[String],
+    redirection_file: Option<&str>,
+) -> Result<Option<String>, String> {
+    
+    let mut command = Command::new(command_path);
 
     // Conditionally set argv[0] on Unix systems
     #[cfg(unix)]
     {
-        command_proc.arg0(command_name);
+        command.arg0(command_name);
     }
-
     // Add the res of the arguments
-    command_proc.args(args);
+    command.args(args);
 
-    // Execute the command and capture its output (stdout, stderr, status)
-    match command_proc.output() {
-        Ok(output) => {
-            if output.status.success() {
-                // Command executed successfully (exit code 0)
-                // Comvert stdout bytes to a String. Use lossy conversion for robustness.
-                let stdout_str: String = String::from_utf8_lossy(&output.stdout).to_string();
-                Ok(stdout_str)
-            } else {
-                // Command execuuted but return a non-zero exit code
-                let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
-                Err(format!("{}", stderr_str.trim_end())) // Trim trailing whitespace/newline often found in stderr
-            }
+    // Stderr always goes to the terminal in this version
+    command.stderr(Stdio::inherit());
+
+    // Configure stdout based on redirection
+    let mut redir_file_handle: Option<File> = None;
+    let stdout_config = match redirection_file {
+        Some(filename) => {
+            // Attempt to create/trancate the file for writing
+            let file = File::create(filename)
+                .map_err(|e| format!("failed to open redirect file '{}': {}", filename, e))?;
+            // Clone the handle for Stdio, store original to ensure it stays open
+            let stdio_handle = file.try_clone()
+                .map_err(|e| format!("failed to clone file handle for redirect: {}", e))?;
+            redir_file_handle = Some(file);
+            Stdio::from(stdio_handle)
         }
-        Err(err) => {
-            // Failed to spawn or run the command itself (e.g., file not founc)
-            // Determine which name to report in the error message
-            #[cfg(unix)]
-            let name_to_report = command_name;
-            #[cfg(not(unix))]
-            let name_to_report = command_path;
+        None => Stdio::piped(), // Capture stdout if not redirecting
+    };
 
-            if err.kind() == io::ErrorKind::NotFound {
-                // Specifically handle "command not found" using the path
-                Err(format!("Failed to execute command: '{}' not found. Error: {}", command_path, err))
-            } else {
-                Err(format!("Failed to spawn process '{}': {}", name_to_report, err))
+    command.stdout(stdout_config);
+
+    // Spawnd the command
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == ErrorKind::NotFound {
+            // Use command_name fpr user-facing error, path might be confusing
+            format!("{}: command not found", command_name)
+        } else {
+            format!("failed to execute command '{}': {}", command_name, e)
+        }
+    })?;
+
+    // Handle output / waiting
+    let mut captured_stdout = String::new();
+    if redirection_file.is_none() {
+        // If stdout is piped, read it *before* waiting
+        if let Some(mut child_stdout) = child.stdout.take() {
+            // Reading can fail, report but preceed to wait for status
+            if let Err(e) = child_stdout.read_to_string(&mut captured_stdout) {
+                // Use eprintln directly as this is an intermediate shell warning
+                eprintln!("shell: warning: error reading command stdout pipe: {}", e);
             }
         }
     }
-}
 
+    // Wait for the command to complete to get its exit status
+    let status = child.wait()
+        .map_err(|e| format!("failed to wait for command '{}': {}", command_name, e))?;
 
-fn change_dir(path: &str) -> Result<(), String> {
-    let target_path = if path == "~" {
-        match env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => {
-                return Err(format!("cd: HOME environment variable not set"));
-            }
+    drop(redir_file_handle);
+
+    // Determine final result based on exit status
+    if status.success() {
+        if redirection_file.is_none() {
+            Ok(Some(captured_stdout)) // Success, return captures stdout
+        } else {
+            Ok(None) // Success, stdout went to file
         }
     } else {
-        path.to_string()
-    };
-
-    if env::set_current_dir(&target_path).is_err() {
-        return Err(format!("cd: {}: No such file or directory", target_path));
-    }
-
-    Ok(())
-}
-
-fn print_to_file(text: &str, file_path: &str) -> std::io::Result<()> {
-    // Open the file with options:
-    // - create(true): Create the file if it doesn't exist.
-    // - write(true): Allow writing to the file.
-    // - truncate(true): If the file exists, clear its contents before writing.
-    let mut file = File::options()
-        .create(true)
-        .write(true)
-        .truncate(true) // This is the key change for overwriting
-        .open(file_path)?;
-
-    // Write the entire text to the (now potentially empty) file.
-    file.write_all(text.as_bytes())?; // Added ? for error propagation
-
-    Ok(()) // Indicate success
-}
-
-fn handle_echo(args: &[String]) -> String {
-    match args {
-        // Case 1: No arguments -> print newline
-        [] => "\n".to_string(),
-        // Case 2: All other argument combinations -> join and print to stdout
-        _ => format!("{}\n", args.join(" "))
+        // Command failed (non-zero exit). Stderr was already printed via inherit.
+        // Return an empty error string to signal failure without the shell printing more.
+        Err(String::new())
     }
 }
 
-fn handle_pwd(args: &[String]) -> Result<String, String> {
-    match args {
-        [] => match env::current_dir() {
-            Ok(dir) => Ok(format!("{}\n", dir.display())),
-            Err(e) => Err(format!("pwd: error getting current directory: {}\n", e)),
-        },
-        _ => Err(format!("pwd: too many arguments\n"))
-    }
-}
 
-fn handle_cd(args: &[String]) -> Result<String, String> {
-    let res = match args {
-        [] => change_dir("~"),
-        [path] => change_dir(path),
-        _ => Err(format!("cd: too many arguments"))
-    };
-
-    match res {
-        Ok(_) => Ok("\n".to_string()),
-        Err(e) => Ok(format!("cd: {}\n", e)),
-    }
-}
-
-fn handle_type(args: &[String]) -> Result<String, String> {
-    match args {
-        [name] => Ok(format!("{}\n", type_buildin(name))),
-        _ => Err(format!("type: requires exactly one argument\n"))
-    }
-}
-
+// --- Main Loop ---
 fn main() {
     loop {
         print!("$ ");
         io::stdout().flush().unwrap();
 
         // Wait for user input
-        let stdin = io::stdin();
         let mut input = String::new();
-        if stdin.read_line(&mut input).unwrap() == 0 {
-            println!(); // Handle CTRL + D (EOF) gracefully
-            break;
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => { // EOF detected
+                println!(); // Print a newline for clean exit
+                break;
+            },
+            Ok(_) => {}, // Successfully read line
+            Err(e) => {
+                eprintln!("shell: input error: {}", e);
+                break; // Exit on read error
+            }
         }
 
         let input = input.trim();
         if input.is_empty() {
-            continue;
+            continue; // Show prompt again if input is only whitespace
         }
 
+        // Parse tokens
         let tokens: Vec<String> = match parse_tokens(input) {
-            Ok(parsed_tokens) => {
-                if parsed_tokens.is_empty() {
-                    // If parsing results in nothing (e.g. input was just quotes), continue
-                    continue;
-                }
-                parsed_tokens
-            }
+            Ok(parsed_token) if parsed_token.is_empty() => continue, // Input was only quotes, etc.
+            Ok(parsed_tokens) => parsed_tokens,
             Err(e) => {
                 println!("Parse error: {}", e);
-                continue; // Skip to next command on parse error
+                continue; // Skip to next command
             }
         };
 
-        let (command_name, args) = tokens.split_first().unwrap(); // Safe due to empty check above
+        // Safe unwrap due to empty check above
+        let (command_name, args_slice) = tokens.split_first().unwrap();
 
-        let (args, redirection_part) = match args.iter().position(|arg| arg == ">" || arg == "1>") {
-            // Operator found: Check if it's at the second-to-last position
-            Some(index) if args.len() >= 2 && index == args.len() - 2 => {
-                // Condition met: Split args at the operator index
-                // The command part is everything before the operator.
-                // The redirection part is the operator and the filename after it.
-                (&args[..index], &args[index..])
+        // --- Simple Redirection Parsing (handles "> file" at the end) ---
+        let mut command_args: Vec<String> = Vec::new();
+        let mut redirection_filename: Option<&str> = None;
+        let mut skip_next_arg = false; // Flag to skip filename after '>'
+
+        for (i, arg) in args_slice.iter(). enumerate() {
+            if skip_next_arg {
+                skip_next_arg = false;
+                continue;
             }
-            // Catch-all for other cases:
-            // - Operator not found (None)
-            // - Operator found, but not at the required position (Some(index) where guard is false)
-            _ => {
-                // Treat the entire args slice as the command part, no redirection
-                (args, &[] as &[String])
+
+            // Check if current arg is '>' or '1>' AND it's the second-to-last arg
+            if (arg == ">" || arg == "1>") && i == args_slice.len() - 2 {
+                // The next argument is the filename
+                redirection_filename = Some(&args_slice[i + 1]);
+                skip_next_arg = true; // Skip the filename in the next iteration
+            } else {
+                // Not a redirection operator at the end, treat as a normal argument
+                command_args.push(arg.clone());
             }
-        };
-        
-        let result = match command_name.as_str() {
+        }
+        // --- End Redirection Parsing ---
+
+        let result: Result<Option<String>, String> = match command_name.as_str() {
             "exit" => {
-                // Default exit code 0 if not specified or invalid
-                let code = args.get(0).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                // Use command_args which excludes redirection parts
+                let code = command_args.first().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                 std::process::exit(code);
             }
-            "echo" => Ok(handle_echo(args)), // Pass the parsed String args
-            "pwd" => handle_pwd(args),
-            "cd" => handle_cd(args),
-            "type" => handle_type(args),
-            // Handle external commands
+            "echo" => handle_echo(&command_args),
+            "pwd" => handle_pwd(&command_args),
+            "cd" => handle_cd(&command_args),
+            "type" => handle_type(&command_args),
+            // --- External Command ---
             cmd => {
-                // Find the executable path using the updated function
                 match find_exec_in_path(cmd) {
                     Some(full_path) => {
-                        // Call try_call with the full path and parsed args
-                        try_call(cmd, &full_path, args)
+                        // Pass the parsed command_args and optional filename
+                        execute_external_command(cmd, &full_path, &command_args, redirection_filename)
                     }
-                    None => {
-                        Err(format!("{}: command not found", cmd))
-                    }
+                    None => Err(format!("{}: command not found", cmd)),
                 }
             }
         };
 
+        // Handle command result (Output or Error)
         match result {
-            Ok(output) => {
-                match redirection_part {
-                    [sign, filename] if sign == ">" || sign == "1>" => {
-                        match print_to_file(&output, filename) {
-                            Err(e) => eprintln!("{}\n", e),
-                            _ => ()
+            Ok(Some(output_str)) => {
+                // Check if redirection was requested for this command
+                if let Some(filename) = redirection_filename {
+                    // Attempt to create/truncate the file for writing
+                    match File::create(filename) {
+                        Ok(mut file) => {
+                            // Write the output string (produced by the built-in) to the file
+                            if let Err(e) = file.write_all(output_str.as_bytes()) {
+                                // Report error writing to the redirected file
+                                eprintln!("shell: error writing to redirect file '{}': {}", filename, e);
+                                // Potentially set an error status ($?) here in the future
+                            }
+                            // Successfully wrote (or tried to write) to file, don't print to stdout.
+                        }
+                        Err(e) => {
+                            // Report error opening the redirected file
+                            eprintln!("shell: failed to open redirect file '{}': {}", filename, e);
+                            // Potentially set an error status ($?) here in the future
                         }
                     }
-                    _ => { 
-                        print!("{}", output);
-                        io::stdout().flush().unwrap(); // Ensure output is written immediately
-                    }
+                } else {
+                    // No redirection, print the output to stdout as before
+                    print!("{}", output_str);
+                    io::stdout().flush().unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
                 }
-            },
-            Err(err) => {
-                eprintln!("{}", err);
+            }
+            Ok(None) => {
+                // Command succeeded, no stdout to print (e.g., cd, external cmd redirected internally)
+                // Successfully executed, do nothing more.
+            }
+            Err(err_msg) => {
+                // Command failed OR shell encountered an error executing it.
+                if !err_msg.is_empty() {
+                    // Print specific error from shell/builtin handlers
+                    eprintln!("{}", err_msg);
+                }
+                // If err_msg is empty, it implies non-zero exit from external command,
+                // and stderr was already handled by Stdio::inherit. Don't print anything more.
+
+                // Future enhancement: Set a last exit code variable here ($?).
             }
         }
     }
