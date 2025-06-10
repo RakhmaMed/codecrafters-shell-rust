@@ -4,7 +4,7 @@
 //! including stdout and stderr redirections with overwrite and append modes.
 
 /// Represents the mode of redirection operation.
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum RedirectionMode {
     /// Overwrite the target file (> or 1> or 2>)
     Overwrite,

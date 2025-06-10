@@ -1,17 +1,21 @@
 #![allow(clippy::comparison_to_empty)] // Allow Err("") for external command failure status
 
+mod builtins;
+mod exec;
 mod parser;
 mod redirect;
-mod exec;
-mod builtins;
+mod utils;
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{stdin, stdout, Write};
+use termion::event::Key;
+use termion::input::TermRead;
+use termion::raw::IntoRawMode;
 
+use builtins::{handle_cd, handle_echo, handle_exit, handle_pwd, handle_type};
+use exec::{execute_external_command, find_exec_in_path};
 use parser::parse_tokens;
-use redirect::{parse_redirections, Redirections, RedirectionMode};
-use exec::{find_exec_in_path, execute_external_command};
-use builtins::{handle_echo, handle_pwd, handle_type, handle_cd, handle_exit};
+use redirect::{parse_redirections, RedirectionMode, Redirections};
 
 // Convention: Result<Option<String>, String>
 // Ok(Some(output)): Success, print output (unless redirected)
@@ -42,117 +46,116 @@ fn dispatch_command(
     }
 }
 
+/// Creates a file with the appropriate mode (overwrite/append) for redirection.
+fn create_redirect_file(filename: &str, mode: RedirectionMode) -> Result<File, std::io::Error> {
+    // Check if the target is an existing directory
+    if let Ok(metadata) = std::fs::metadata(filename) {
+        if metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("'{}' is a directory", filename),
+            ));
+        }
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(mode == RedirectionMode::Overwrite)
+        .append(mode == RedirectionMode::Append)
+        .open(filename)
+}
+
+/// Ensures a redirect file exists, ignoring errors (used for "touch" behavior).
+fn ensure_redirect_file_exists(filename: &str, mode: RedirectionMode) {
+    let _ = create_redirect_file(filename, mode);
+}
+
+/// Writes output to stdout, either to a redirect file or terminal.
+fn write_stdout(output: &str, redirections: &Redirections) {
+    if let Some(stdout_redirect) = &redirections.stdout_redirect {
+        match create_redirect_file(&stdout_redirect.filename, stdout_redirect.mode) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(output.as_bytes()) {
+                    raw_eprintln!(
+                        "shell: error writing built-in stdout to '{}': {}",
+                        &stdout_redirect.filename,
+                        e
+                    );
+                }
+            }
+            Err(e) => raw_eprintln!(
+                "shell: failed to open stdout redirect file '{}': {}",
+                &stdout_redirect.filename,
+                e
+            ),
+        }
+    } else {
+        raw_print!("{}", output);
+    }
+}
+
+/// Writes error message to stderr, either to a redirect file or terminal.
+fn write_stderr(error_msg: &str, redirections: &Redirections) {
+    if let Some(stderr_redirect) = &redirections.stderr_redirect {
+        match File::create(&stderr_redirect.filename) {
+            Ok(mut file) => {
+                if let Err(e) = writeln!(file, "{}", error_msg) {
+                    raw_eprintln!(
+                        "shell: error writing error to stderr redirect file '{}': {}",
+                        &stderr_redirect.filename,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                raw_eprintln!(
+                    "shell: failed to open stderr redirect file '{}': {}",
+                    &stderr_redirect.filename,
+                    e
+                );
+                raw_eprintln!("{}", error_msg);
+            }
+        }
+    } else {
+        raw_eprintln!("{}", error_msg);
+    }
+}
+
+/// Ensures both stdout and stderr redirect files exist if specified.
+fn ensure_redirect_files_exist(redirections: &Redirections) {
+    if let Some(stdout_redirect) = &redirections.stdout_redirect {
+        ensure_redirect_file_exists(&stdout_redirect.filename, stdout_redirect.mode);
+    }
+    if let Some(stderr_redirect) = &redirections.stderr_redirect {
+        ensure_redirect_file_exists(&stderr_redirect.filename, stderr_redirect.mode);
+    }
+}
+
 /// Handles the result from dispatch_command, printing output/errors appropriately
 /// respecting redirection settings.
 fn handle_command_result(result: Result<Option<String>, String>, redirections: &Redirections) {
     match result {
         Ok(Some(output_str)) => {
             // Success with output (built-in, or external without '>')
-            if let Some(stdout) = &redirections.stdout_redirect {
-                // Redirect BUILT-IN output
-                match OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(stdout.mode == RedirectionMode::Overwrite)
-                    .append(stdout.mode == RedirectionMode::Append)
-                    .open(&stdout.filename)
-                {
-                    Ok(mut file) => {
-                        if let Err(e) = file.write_all(output_str.as_bytes()) {
-                            eprintln!(
-                                "shell: error writing built-in stdout to '{}': {}",
-                                &stdout.filename, e
-                            );
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "shell: failed to open stdout redirect file '{}': {}",
-                        &stdout.filename, e
-                    ),
-                }
-                // Ensure stderr file exists if 2> also used
-                if let Some(err_f) = &redirections.stderr_redirect {
-                    if OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(err_f.mode == RedirectionMode::Overwrite)
-                        .append(err_f.mode == RedirectionMode::Append)
-                        .open(&err_f.filename)
-                        .is_err()
-                    { /* ignore */ }
-                }
-            } else {
-                // Print output to terminal stdout
-                print!("{}", output_str);
-                io::stdout()
-                    .flush()
-                    .unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
-                // Ensure stderr file exists if 2> also used
-                if let Some(err_f) = &redirections.stderr_redirect {
-                    if OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(err_f.mode == RedirectionMode::Overwrite)
-                        .append(err_f.mode == RedirectionMode::Append)
-                        .open(&err_f.filename)
-                        .is_err()
-                    { /* ignore */ }
-                }
+            write_stdout(&output_str, redirections);
+            // Ensure stderr file exists if 2> also used
+            if let Some(stderr_redirect) = &redirections.stderr_redirect {
+                ensure_redirect_file_exists(&stderr_redirect.filename, stderr_redirect.mode);
             }
         }
         Ok(None) => {
             // Success, no direct output string (cd, external with '>', external no output)
-            // Ensure stderr file exists if 2> used
-            if let Some(err_f) = &redirections.stderr_redirect {
-                if OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(err_f.mode == RedirectionMode::Overwrite)
-                    .append(err_f.mode == RedirectionMode::Append)
-                    .open(&err_f.filename)
-                    .is_err()
-                { /* ignore */ }
-            }
-            // Stdout redirection for external commands was handled internally
+            ensure_redirect_files_exist(redirections);
         }
         Err(err_msg) => {
             // Command failed
             if !err_msg.is_empty() {
                 // Built-in or shell error (e.g., "not found", "cd failed")
-                // Handle stderr redirection for this error message
-                if let Some(stderr) = &redirections.stderr_redirect {
-                    match File::create(&stderr.filename) {
-                        Ok(mut file) => {
-                            if let Err(e) = writeln!(file, "{}", err_msg) {
-                                eprintln!(
-                                    "shell: error writing error to stderr redirect file '{}': {}",
-                                    &stderr.filename, e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            // Failed to open redirect file, print original error to terminal
-                            eprintln!(
-                                "shell: failed to open stderr redirect file '{}': {}",
-                                &stderr.filename, e
-                            );
-                            eprintln!("{}", err_msg);
-                        }
-                    }
-                } else {
-                    // Print error to terminal stderr
-                    eprintln!("{}", err_msg);
-                }
+                write_stderr(&err_msg, redirections);
                 // Ensure stdout file exists if > was used with a failed built-in/shell command
-                if let Some(out_f) = &redirections.stdout_redirect {
-                    if OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(out_f.mode == RedirectionMode::Overwrite)
-                        .append(out_f.mode == RedirectionMode::Append)
-                        .open(&out_f.filename)
-                        .is_err()
-                    { /* ignore */ }
+                if let Some(stdout_redirect) = &redirections.stdout_redirect {
+                    ensure_redirect_file_exists(&stdout_redirect.filename, stdout_redirect.mode);
                 }
             }
             // else: err_msg is empty, indicating external command failed (non-zero exit).
@@ -163,22 +166,39 @@ fn handle_command_result(result: Result<Option<String>, String>, redirections: &
 
 /// Main shell loop
 fn main() {
+    let builtins = vec!["exit", "echo", "help", "cd"];
     loop {
         // 1. Print prompt
-        print!("$ ");
-        io::stdout().flush().unwrap();
+        let stdin = stdin();
+        let mut stdout = stdout().into_raw_mode().unwrap();
+        write!(stdout, "$ ").unwrap();
+        stdout.flush().unwrap();
 
-        // 2. Read input
+        // 2. Read input char by char
         let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => {
-                println!();
-                break;
-            } // EOF
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("shell: input error: {}", e);
-                break;
+        for key in stdin.keys() {
+            if let Ok(key) = key {
+                match key {
+                    Key::Char('\t') => {
+                        let matches = builtins.iter().find(|&builtin| builtin.starts_with(&input));
+                        if let Some(matched) = matches {
+                            write!(stdout, "{} ", &matched[input.len()..]).unwrap();
+                            input = matched.to_string() + " ";
+                        }
+                        stdout.flush().unwrap();
+                    }
+                    Key::Char('\n') => {
+                        write!(stdout, "\r\n").unwrap();
+                        stdout.flush().unwrap();
+                        break;
+                    }
+                    Key::Char(c) => {
+                        input.push(c);
+                        write!(stdout, "{}", c).unwrap();
+                        stdout.flush().unwrap();
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -193,7 +213,7 @@ fn main() {
             Ok(parsed) if parsed.is_empty() => continue, // e.g., input was `""`
             Ok(parsed) => parsed,
             Err(e) => {
-                eprintln!("shell: parse error: {}", e);
+                raw_eprintln!("shell: parse error: {}", e);
                 continue;
             }
         };

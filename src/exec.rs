@@ -1,12 +1,12 @@
 //! External command execution module for the rust shell.
-//! 
+//!
 //! This module handles finding executables in the PATH and executing
 //! external commands with proper I/O redirection and error handling.
 
 use crate::redirect::{RedirectionMode, Redirections};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt; // For execute bits
 #[cfg(unix)]
@@ -15,14 +15,14 @@ use std::process::{Command, Stdio};
 
 /// Searches a single directory for an executable file name. Checks execute bits on Unix.
 /// Skips directories that are NotFound or inaccessible, returns other IO errors.
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `dir_path` - The directory path to search in
 /// * `name` - The executable name to search for
-/// 
+///
 /// # Returns
-/// 
+///
 /// * `Ok(Some(path))` - Found executable at the given path
 /// * `Ok(None)` - Executable not found in this directory
 /// * `Err(e)` - IO error occurred while searching
@@ -61,24 +61,24 @@ pub fn find_exec_in_dir(dir_path: &str, name: &str) -> io::Result<Option<String>
 }
 
 /// Finds an executable: checks direct path if `name` contains '/', otherwise searches PATH env var.
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `name` - The command name or path to search for
-/// 
+///
 /// # Returns
-/// 
+///
 /// * `Some(path)` - Found executable at the given path
 /// * `None` - Executable not found
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```
 /// use codecrafters_shell::exec::find_exec_in_path;
-/// 
+///
 /// // Direct path
 /// let result = find_exec_in_path("/bin/ls");
-/// 
+///
 /// // Search in PATH
 /// let result = find_exec_in_path("ls");
 /// ```
@@ -119,16 +119,16 @@ pub fn find_exec_in_path(name: &str) -> Option<String> {
 /// Executes an external command, handling args, stdio redirection, and waiting.
 /// Returns Ok(None) on success (exit 0), Err("") on failure (non-zero exit),
 /// or Err(message) on spawn/wait errors.
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `command_name` - The command name for error messages and arg0
 /// * `command_path` - The full path to the executable
 /// * `args` - The command arguments
 /// * `redirections` - The I/O redirection configuration
-/// 
+///
 /// # Returns
-/// 
+///
 /// * `Ok(None)` - Command succeeded (exit code 0)
 /// * `Err("")` - Command failed with non-zero exit code
 /// * `Err(message)` - Error spawning or waiting for command
@@ -151,56 +151,112 @@ pub fn execute_external_command(
 
     // Stdout: Redirect to file or pipe
     let stdout_stdio = match &redirections.stdout_redirect {
-        Some(stdout) => match OpenOptions::new()
-            .read(false)
-            .write(true)
-            .create(true)
-            .truncate(stdout.mode == RedirectionMode::Overwrite)
-            .append(stdout.mode == RedirectionMode::Append)
-            .open(&stdout.filename)
-        {
-            Ok(file) => match file.try_clone() {
-                Ok(cloned) => {
-                    stdout_handle = Some(file);
-                    Stdio::from(cloned)
+        Some(stdout) => {
+            // Check if the target is an existing directory
+            if let Ok(metadata) = fs::metadata(&stdout.filename) {
+                if metadata.is_dir() {
+                    return Err(format!(
+                        "{cmd}: {}: Is a directory",
+                        stdout.filename,
+                        cmd = command_name
+                    ));
                 }
-                Err(e) => return Err(format!("failed to clone stdout file handle: {}", e)),
-            },
-            Err(e) => {
-                return Err(format!(
-                    "failed to open stdout redirect file '{}': {}",
-                    stdout.filename, e
-                ))
             }
-        },
+
+            match OpenOptions::new()
+                .read(false)
+                .write(true)
+                .create(true)
+                .truncate(stdout.mode == RedirectionMode::Overwrite)
+                .append(stdout.mode == RedirectionMode::Append)
+                .open(&stdout.filename)
+            {
+                Ok(file) => match file.try_clone() {
+                    Ok(cloned) => {
+                        stdout_handle = Some(file);
+                        Stdio::from(cloned)
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "{cmd}: {}: {}",
+                            stdout.filename,
+                            e,
+                            cmd = command_name
+                        ))
+                    }
+                },
+                Err(e) => {
+                    let msg: String = match &e.kind() {
+                        ErrorKind::NotFound => "No such file or directory".to_owned(),
+                        ErrorKind::PermissionDenied => "Permission denied".to_owned(),
+                        // ErrorKind::IsADirectory => "Is a directory",
+                        _ => e.to_string(),
+                    };
+                    return Err(format!(
+                        "{cmd}: {}: {}",
+                        stdout.filename,
+                        msg,
+                        cmd = command_name
+                    ));
+                }
+            }
+        }
         None => Stdio::piped(), // Pipe if not redirecting
     };
     command.stdout(stdout_stdio);
 
     // Stderr: Redirect to file or inherit
     let stderr_stdio = match &redirections.stderr_redirect {
-        Some(stderr) => match OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(stderr.mode == RedirectionMode::Overwrite)
-            .append(stderr.mode == RedirectionMode::Append)
-            .open(&stderr.filename)
-        {
-            Ok(file) => match file.try_clone() {
-                Ok(cloned) => {
-                    stderr_handle = Some(file);
-                    Stdio::from(cloned)
+        Some(stderr) => {
+            // Check if the target is an existing directory
+            if let Ok(metadata) = fs::metadata(&stderr.filename) {
+                if metadata.is_dir() {
+                    return Err(format!(
+                        "{cmd}: {}: Is a directory",
+                        stderr.filename,
+                        cmd = command_name
+                    ));
                 }
-                Err(e) => return Err(format!("failed to clone stderr file handle: {}", e)),
-            },
-            Err(e) => {
-                return Err(format!(
-                    "failed to open stderr redirect file '{}': {}",
-                    stderr.filename, e
-                ))
             }
-        },
-        None => Stdio::inherit(), // Inherit shell's stderr if not redirecting
+
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(stderr.mode == RedirectionMode::Overwrite)
+                .append(stderr.mode == RedirectionMode::Append)
+                .open(&stderr.filename)
+            {
+                Ok(file) => match file.try_clone() {
+                    Ok(cloned) => {
+                        stderr_handle = Some(file);
+                        Stdio::from(cloned)
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "{cmd}: {}: {}",
+                            stderr.filename,
+                            e,
+                            cmd = command_name
+                        ))
+                    }
+                },
+                Err(e) => {
+                    let msg = match e.kind() {
+                        ErrorKind::NotFound => "No such file or directory".to_string(),
+                        ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                        // ErrorKind::IsADirectory => "Is a directory".to_string(),
+                        _ => e.to_string(),
+                    };
+                    return Err(format!(
+                        "{cmd}: {}: {}",
+                        stderr.filename,
+                        msg,
+                        cmd = command_name
+                    ));
+                }
+            }
+        }
+        None => Stdio::piped(), // Pipe stderr for raw mode formatting
     };
     command.stderr(stderr_stdio);
 
@@ -218,8 +274,20 @@ pub fn execute_external_command(
     if redirections.stdout_redirect.is_none() {
         if let Some(mut child_stdout) = child.stdout.take() {
             if let Err(e) = child_stdout.read_to_string(&mut captured_stdout) {
+                // TODO: return error, not print
                 // Non-fatal error reading pipe, warn but proceed
-                eprintln!("shell: warning: error reading command stdout pipe: {}", e);
+                crate::raw_eprintln!("shell: warning: error reading command stdout pipe: {}", e);
+            }
+        }
+    }
+
+    // Capture stderr only if it was piped (not redirected)
+    let mut captured_stderr = String::new();
+    if redirections.stderr_redirect.is_none() {
+        if let Some(mut child_stderr) = child.stderr.take() {
+            if let Err(e) = child_stderr.read_to_string(&mut captured_stderr) {
+                // Non-fatal error reading pipe, warn but proceed
+                crate::raw_eprintln!("shell: warning: error reading command stderr pipe: {}", e);
             }
         }
     }
@@ -233,12 +301,17 @@ pub fn execute_external_command(
     drop(stdout_handle);
     drop(stderr_handle);
 
+    // TODO: enhance caret replacement
     // Print captured stdout if any *before* checking status
-    if !captured_stdout.is_empty() {
-        print!("{}", captured_stdout);
-        io::stdout()
-            .flush()
-            .unwrap_or_else(|e| eprintln!("shell: error flushing stdout: {}", e));
+    let formatted_output = captured_stdout.replace('\n', "\r\n");
+    if !formatted_output.is_empty() {
+        crate::raw_print!("{}", formatted_output);
+    }
+
+    // Print captured stderr if any
+    let formatted_stderr = captured_stderr.replace('\n', "\r\n");
+    if !formatted_stderr.is_empty() {
+        crate::raw_eprint!("{}", formatted_stderr);
     }
 
     // --- Return status ---
